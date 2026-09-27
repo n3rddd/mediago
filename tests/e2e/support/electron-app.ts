@@ -12,11 +12,14 @@ import {
 } from "@playwright/test";
 import { MediaGoClient } from "../../../packages/core-sdk/src/index.ts";
 import {
+  attachBoundedProcessLogs,
   finalizeManualContextArtifacts,
   manualArtifactPaths,
   startManualContextArtifacts,
 } from "./artifacts.ts";
+import { captureProcessOutput, type ProcessOutput } from "./process.ts";
 import { scrubElectronEnvironment } from "./electron-network.ts";
+import { waitForElectronMainWindow } from "./electron-window.ts";
 import {
   closeElectron,
   readProcessIdentity,
@@ -113,6 +116,7 @@ export const electronTest = base.extend<{
         path.join(tmpdir(), "mediago-e2e-browser-"),
       );
       let application: ElectronApplication | undefined;
+      let electronOutput: ProcessOutput | undefined;
       let electronIdentity: ProcessIdentity | undefined;
       let mainPage: Page | undefined;
       let tracingStarted = false;
@@ -153,42 +157,17 @@ export const electronTest = base.extend<{
           artifactsDir: artifactPaths.artifactsDir,
           recordVideo: { dir: artifactPaths.videoDir },
         });
+        electronOutput = captureProcessOutput(application.process());
         const electronPid = application.process().pid;
         if (electronPid === undefined)
           throw new Error("Electron PID is unavailable");
         electronIdentity = await readProcessIdentity(electronPid);
         if (!electronIdentity)
           throw new Error("Electron exited during startup");
+        const page = await waitForElectronMainWindow(application);
+        mainPage = page;
         await startManualContextArtifacts(application.context());
         tracingStarted = true;
-
-        await application.firstWindow();
-        await expect
-          .poll(() =>
-            application
-              ?.windows()
-              .find((candidate) => candidate.url() === "http://localhost:8500/")
-              ?.url(),
-          )
-          .toBe("http://localhost:8500/");
-        const page = application
-          .windows()
-          .find((candidate) => candidate.url() === "http://localhost:8500/");
-        if (!page) throw new Error("Electron main window was not available");
-        mainPage = page;
-
-        await expect
-          .poll(() =>
-            page.evaluate(
-              () =>
-                typeof (
-                  window as Window & {
-                    electron?: { app?: { getEnvPath?: unknown } };
-                  }
-                ).electron?.app?.getEnvPath,
-            ),
-          )
-          .toBe("function");
         const envPath = normalizeEnvPath(
           await page.evaluate(() => {
             const api = (
@@ -243,7 +222,17 @@ export const electronTest = base.extend<{
         async () => {
           if (!application) return;
           const close = () => closeElectron(application, electronIdentity);
-          if (!tracingStarted) return close();
+          if (!tracingStarted) {
+            try {
+              await close();
+            } finally {
+              await attachBoundedProcessLogs(testInfo, {
+                electron: electronOutput,
+                ui: ui?.process,
+              });
+            }
+            return;
+          }
           await finalizeManualContextArtifacts({
             testInfo,
             context: application.context(),
@@ -253,9 +242,10 @@ export const electronTest = base.extend<{
               primaryError !== undefined ||
               testInfo.status !== testInfo.expectedStatus,
             name: "electron",
-            processes: { ui: ui?.process },
+            processes: { electron: electronOutput, ui: ui?.process },
           });
         },
+        () => electronOutput?.dispose(),
         () => waitForPortFree("0.0.0.0", ELECTRON_CORE_PORT, 10_000),
         () => ui?.process.stop(),
         () => agent?.close(),

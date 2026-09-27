@@ -38,7 +38,12 @@ import {
   type ProcessIdentity,
 } from "../support/electron-process.ts";
 import { assertPortFree, waitForPortFree } from "../support/ports.ts";
-import { redactDiagnostic } from "../support/process.ts";
+import { waitForElectronMainWindow } from "../support/electron-window.ts";
+import {
+  captureProcessOutput,
+  redactDiagnostic,
+  type ProcessOutput,
+} from "../support/process.ts";
 import {
   startUIProcess,
   type StartedUIProcess,
@@ -86,6 +91,7 @@ interface ElectronResources {
   application?: ElectronApplication;
   context?: BrowserContext;
   electronIdentity?: ProcessIdentity;
+  electronOutput?: ProcessOutput;
   media?: MediaFixture;
   page?: Page;
   ui?: StartedUIProcess;
@@ -213,7 +219,10 @@ async function attachCleanupDiagnostics(
   errors: readonly string[],
 ): Promise<void> {
   try {
-    await attachBoundedProcessLogs(testInfo, { ui: resources.ui?.process });
+    await attachBoundedProcessLogs(testInfo, {
+      electron: resources.electronOutput,
+      ui: resources.ui?.process,
+    });
   } catch {
     // Preserve the primary test or cleanup error.
   }
@@ -266,6 +275,9 @@ const test = base.extend<{ electronRuntime: ElectronRuntime }>({
           artifactsDir: artifactPaths.artifactsDir,
           recordVideo: { dir: artifactPaths.videoDir },
         });
+        resources.electronOutput = captureProcessOutput(
+          resources.application.process(),
+        );
         const electronPid = resources.application.process().pid;
         if (electronPid === undefined) {
           throw new Error(
@@ -281,38 +293,10 @@ const test = base.extend<{ electronRuntime: ElectronRuntime }>({
 
         networkGuard = await installElectronNetworkGuard(resources.application);
         resources.context = resources.application.context();
+        resources.page = await waitForElectronMainWindow(resources.application);
         await startManualContextArtifacts(resources.context);
         tracingStarted = true;
-
-        await resources.application.firstWindow();
-        await expect
-          .poll(() =>
-            resources.application
-              ?.windows()
-              .find((page) => page.url() === "http://localhost:8500/")
-              ?.url(),
-          )
-          .toBe("http://localhost:8500/");
-        resources.page = resources.application
-          .windows()
-          .find((page) => page.url() === "http://localhost:8500/");
-        if (!resources.page) {
-          throw new Error("Electron main window was not available");
-        }
-        expect(resources.page.url()).toBe("http://localhost:8500/");
         await expect(resources.page).toHaveTitle("MediaGo");
-        await expect
-          .poll(() =>
-            resources.page?.evaluate(
-              () =>
-                typeof (
-                  window as Window & {
-                    electron?: { app?: { getEnvPath?: unknown } };
-                  }
-                ).electron?.app?.getEnvPath,
-            ),
-          )
-          .toBe("function");
 
         const ipcResult = await resources.page.evaluate(() => {
           const rendererWindow = window as Window & {
@@ -455,7 +439,10 @@ const test = base.extend<{ electronRuntime: ElectronRuntime }>({
                 FORCE_CLOSE_FAILURE ||
                 FORCE_CLOSE_TIMEOUT,
               name: "electron",
-              processes: { ui: resources.ui?.process },
+              processes: {
+                electron: resources.electronOutput,
+                ui: resources.ui?.process,
+              },
               coreLogDirectory,
             });
           } catch (error) {
@@ -569,12 +556,15 @@ const test = base.extend<{ electronRuntime: ElectronRuntime }>({
       ) {
         try {
           await attachBoundedProcessLogs(testInfo, {
+            electron: resources.electronOutput,
             ui: resources.ui?.process,
           });
         } catch {
           // Preserve the primary or network error.
         }
       }
+
+      resources.electronOutput?.dispose();
 
       if (setupError !== undefined) throw setupError;
       if (primaryExists) return;
@@ -605,8 +595,8 @@ test("downloads a direct MP4 through Electron and shuts down Core", async ({
   }
 
   await electronRuntime.page
-    .getByRole("button", { name: "New download" })
-    .first()
+    .locator("header")
+    .getByRole("button", { name: "New download", exact: true })
     .click();
   await electronRuntime.page
     .getByRole("combobox", { name: "Download type" })
